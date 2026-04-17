@@ -76,6 +76,9 @@ func CompInfo() (*Win32_ComputerSystem, error) {
 	if err := wmi.Query(wmi.CreateQuery(&result, ""), &result); err != nil {
 		return nil, err
 	}
+	if len(result) < 1 {
+		return nil, errors.New("no computer system information found")
+	}
 	if result[0].DNSHostName == "" {
 		return nil, errors.New("could not determine the DNS Host Name")
 	}
