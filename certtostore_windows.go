@@ -34,8 +34,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf16"
 	"unsafe"
@@ -131,8 +133,9 @@ const (
 	// NCryptPadOAEPFlag is used with Decrypt to specify whether to use OAEP.
 	NCryptPadOAEPFlag = 0x00000004 // NCRYPT_PAD_OAEP_FLAG
 
-	// key creation flags.
+	// key creation and lookup flags.
 	nCryptMachineKey   = 0x20 // NCRYPT_MACHINE_KEY_FLAG
+	nCryptSilentFlag   = 0x40 // NCRYPT_SILENT_FLAG
 	nCryptOverwriteKey = 0x80 // NCRYPT_OVERWRITE_KEY_FLAG
 
 	// winerror.h constants
@@ -224,8 +227,10 @@ var (
 	nCryptCreatePersistedKey          = nCrypt.MustFindProc("NCryptCreatePersistedKey")
 	nCryptDecrypt                     = nCrypt.MustFindProc("NCryptDecrypt")
 	nCryptDeleteKey                   = nCrypt.MustFindProc("NCryptDeleteKey")
+	nCryptEnumKeys                    = nCrypt.MustFindProc("NCryptEnumKeys")
 	nCryptExportKey                   = nCrypt.MustFindProc("NCryptExportKey")
 	nCryptFinalizeKey                 = nCrypt.MustFindProc("NCryptFinalizeKey")
+	nCryptFreeBuffer                  = nCrypt.MustFindProc("NCryptFreeBuffer")
 	nCryptFreeObject                  = nCrypt.MustFindProc("NCryptFreeObject")
 	nCryptOpenKey                     = nCrypt.MustFindProc("NCryptOpenKey")
 	nCryptOpenStorageProvider         = nCrypt.MustFindProc("NCryptOpenStorageProvider")
@@ -1241,6 +1246,87 @@ func setACL(file, access, sid, perm string) error {
 	return nil
 }
 
+// nCryptKeyName corresponds to the NCryptKeyName struct in ncrypt.h.
+type nCryptKeyName struct {
+	pszName         *uint16
+	pszAlgid        *uint16
+	dwLegacyKeySpec uint32
+	dwFlags         uint32
+}
+
+// SetContainer updates the key container name used by Key() and Generate().
+func (w *WinCertStore) SetContainer(container string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.container = container
+}
+
+// parseTimestampedContainer splits a "<prefix>-<UnixNano>" container name into
+// its prefix (including the trailing hyphen) and UnixNano timestamp.
+func parseTimestampedContainer(container string) (string, int64, bool) {
+	idx := strings.LastIndex(container, "-")
+	if idx <= 0 || idx == len(container)-1 {
+		return "", 0, false
+	}
+	ts, err := strconv.ParseInt(container[idx+1:], 10, 64)
+	if err != nil || ts <= 0 {
+		return "", 0, false
+	}
+	return container[:idx+1], ts, true
+}
+
+// latestKeyWithPrefix enumerates keys in w.Prov via NCryptEnumKeys and returns
+// the container name with the given prefix (e.g. "app-") and the newest
+// UnixNano timestamp created within the last 30 seconds.
+func (w *WinCertStore) latestKeyWithPrefix(prefix string, initialTS int64) string {
+	var (
+		keyName   *nCryptKeyName
+		enumState uintptr
+		bestName  string
+		bestTS    int64
+	)
+	now := time.Now()
+	minTS := now.Add(-30 * time.Second).UnixNano()
+	if initialTS > 0 {
+		// Allow slight clock skew before the initial container was initialized.
+		if floor := initialTS - int64(5*time.Second); floor > minTS {
+			minTS = floor
+		}
+	}
+
+	for {
+		keyName = nil
+		r, _, _ := nCryptEnumKeys.Call(
+			uintptr(w.Prov),
+			0,
+			uintptr(unsafe.Pointer(&keyName)),
+			uintptr(unsafe.Pointer(&enumState)),
+			w.keyAccessFlags|nCryptSilentFlag,
+		)
+		if r != 0 {
+			break
+		}
+		if keyName != nil {
+			if keyName.pszName != nil {
+				name := windows.UTF16PtrToString(keyName.pszName)
+				if strings.HasPrefix(name, prefix) && name != w.container {
+					if ts, err := strconv.ParseInt(strings.TrimPrefix(name, prefix), 10, 64); err == nil {
+						if ts >= minTS && ts > bestTS {
+							bestTS = ts
+							bestName = name
+						}
+					}
+				}
+			}
+			nCryptFreeBuffer.Call(uintptr(unsafe.Pointer(keyName)))
+		}
+	}
+	if enumState != 0 {
+		nCryptFreeBuffer.Call(enumState)
+	}
+	return bestName
+}
+
 // Key opens a handle to an existing private key and returns key.
 // Key implements both crypto.Signer and crypto.Decrypter.
 //
@@ -1249,15 +1335,38 @@ func setACL(file, access, sid, perm string) error {
 // with a different provider. Use CertKey() to derive a key directly from a Cert in situations
 // where both are needed.
 func (w *WinCertStore) Key() (Credential, error) {
+	w.mu.Lock()
+	container := w.container
+	w.mu.Unlock()
+
 	var kh uintptr
 	r, _, err := nCryptOpenKey.Call(
 		uintptr(w.Prov),
 		uintptr(unsafe.Pointer(&kh)),
-		uintptr(unsafe.Pointer(wide(w.container))),
+		uintptr(unsafe.Pointer(wide(container))),
 		0,
 		w.keyAccessFlags)
 	if r != 0 {
-		return nil, fmt.Errorf("NCryptOpenKey for container %q returned %X: %v", w.container, r, err)
+		if prefix, initialTS, ok := parseTimestampedContainer(container); ok {
+			// When brokered key generation runs in a separate elevated process,
+			// it generates a key with a newer "<prefix>-<UnixNano>" container name.
+			if candidate := w.latestKeyWithPrefix(prefix, initialTS); candidate != "" {
+				r2, _, err2 := nCryptOpenKey.Call(
+					uintptr(w.Prov),
+					uintptr(unsafe.Pointer(&kh)),
+					uintptr(unsafe.Pointer(wide(candidate))),
+					0,
+					w.keyAccessFlags)
+				if r2 == 0 {
+					return keyMetadata(kh, w)
+				}
+				r, err = r2, err2
+				container = candidate
+			}
+		}
+	}
+	if r != 0 {
+		return nil, fmt.Errorf("NCryptOpenKey for container %q returned %X: %v", container, r, err)
 	}
 
 	return keyMetadata(kh, w)
@@ -1289,6 +1398,9 @@ func (w *WinCertStore) CertKey(cert *windows.CertContext) (*Key, error) {
 	)
 	// If the function succeeds, the return value is nonzero (TRUE).
 	if r == 0 {
+		if errno, ok := err.(syscall.Errno); ok {
+			return nil, fmt.Errorf("cryptAcquireCertificatePrivateKey returned %X (%X): %w", r, uint32(errno), err)
+		}
 		return nil, fmt.Errorf("cryptAcquireCertificatePrivateKey returned %X: %v", r, err)
 	}
 	if mustFree != 0 {
